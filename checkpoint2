@@ -1,0 +1,127 @@
+import os
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import defaultdict
+import shutil
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as sf
+from pyspark.sql import DataFrame, Window
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.feature import StringIndexer, OneHotEncoder
+from pyspark.ml.linalg import Vectors, VectorUDT
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml import Pipeline
+from pyspark.sql.functions import col, lit
+from pyspark.sql.functions import udf
+from pyspark.ml.linalg import VectorUDT
+from pyspark.sql.types import DoubleType, ArrayType
+from pyspark.sql.functions import monotonically_increasing_id
+
+class RNNModel(nn.Module):
+    def __init__(self, n_items, hidden_size=64):
+        super().__init__()
+        self.embed = nn.Embedding(n_items + 1, hidden_size, padding_idx=0)
+        self.rnn = nn.GRU(hidden_size, hidden_size, batch_first=True)
+        self.fc = nn.Linear(hidden_size, n_items + 1)
+
+    def forward(self, x):
+        x = self.embed(x)   
+        out, _ = self.rnn(x)
+        return self.fc(out)
+
+class RNNRecommender:
+    def __init__(self, n_items=1000, seed=42):
+        self.seed = seed
+        self.model = RNNModel(n_items)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+        self.item_set = set()
+        self.n_items = n_items + 1
+
+    def collate_fn(batch):
+        """
+        Pads sequences in a batch to the same length.
+        Each `batch` item is a tuple (sequence_tensor, target).
+        """
+        sequences, targets = zip(*batch)
+        sequences_padded = pad_sequence(sequences, batch_first=True, padding_value=0)
+        targets_padded = pad_sequence(targets, batch_first=True, padding_value=-100)  
+        return sequences_padded, targets_padded
+
+    def fit(self, log, user_features=None, item_features=None):
+        if 'timestamp' not in log.columns:
+            log = log.withColumn("timestamp", monotonically_increasing_id())
+        log = log.orderBy("user_idx", "timestamp")
+        interactions = log.select("user_idx", "item_idx").collect()
+
+        # Build user sequences
+        user_seqs = defaultdict(list)
+        for row in interactions:
+            user_seqs[row["user_idx"]].append(row["item_idx"])
+            self.item_set.add(row["item_idx"])
+
+        sequences = [seq for seq in user_seqs.values() if len(seq) > 1]
+        dataset = InteractionSequenceDataset(sequences)
+        dataloader = DataLoader(dataset, batch_size=32, shuffle=True, collate_fn=RNNRecommender.collate_fn)
+
+        # Train RNN
+        self.model.train()
+        optimizer = optim.Adam(self.model.parameters(), lr=0.01)
+        criterion = nn.CrossEntropyLoss(ignore_index=-100)
+
+        for epoch in range(5):  # Keep epochs low for speed
+            total_loss = 0
+            for x, y in dataloader:
+                x, y = x.to(self.device), y.to(self.device)
+                logits = self.model(x)
+                logits = logits.view(-1, self.n_items)
+                y = y.view(-1)
+                loss = criterion(logits, y)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
+            print(f"Epoch {epoch+1}, Loss: {total_loss:.4f}")
+
+    def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
+        # Reconstruct user sequences
+        if 'timestamp' not in log.columns:
+            log = log.withColumn("timestamp", monotonically_increasing_id())
+        log = log.orderBy("user_idx", "timestamp")
+        interactions = log.select("user_idx", "item_idx").collect()
+
+        user_seqs = defaultdict(list)
+        for row in interactions:
+            user_seqs[row["user_idx"]].append(row["item_idx"])
+
+        self.model.eval()
+        recs = []
+        with torch.no_grad():
+            for user_row in users.collect():
+                uid = user_row["user_idx"]
+                if uid not in user_seqs or len(user_seqs[uid]) < 1:
+                    continue
+
+                seq = torch.tensor(user_seqs[uid][-10:]).unsqueeze(0).to(self.device)
+                logits = self.model(seq)
+                last_logits = logits[0, -1]
+                topk = torch.topk(last_logits, k)
+                top_items = topk.indices.cpu().numpy()
+                top_scores = topk.values.cpu().numpy()
+
+                for item_idx, score in zip(top_items, top_scores):
+                    if item_idx in self.item_set or not filter_seen_items:
+                        recs.append((uid, int(item_idx), float(score)))
+
+        # Convert to Spark DataFrame
+        recs_df = spark.createDataFrame(recs, ["user_idx", "item_idx", "relevance"])
+        return recs_df
