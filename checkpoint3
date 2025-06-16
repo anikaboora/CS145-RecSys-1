@@ -1,1 +1,153 @@
+import numpy as np
+import torch
+import torch.nn as nn
+from torch_geometric.nn import MessagePassing
+from pyspark.sql import DataFrame, functions as sf
+from sim4rec.utils import pandas_to_spark
 
+class BaseRecommender:
+    def __init__(self, seed=None):
+        self.seed = seed
+        np.random.seed(seed)
+    def fit(self, log, user_features=None, item_features=None):
+        raise NotImplementedError()
+    def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
+        raise NotImplementedError()
+
+class LightGCN(MessagePassing):
+    def __init__(self, num_users, num_items, emb_dim=128, n_layers=3):
+        super().__init__(aggr='add')
+        self.emb_dim = emb_dim
+        self.n_layers = n_layers
+        self.num_users = num_users
+        self.num_items = num_items
+        self.user_embed = nn.Embedding(num_users, emb_dim)
+        self.item_embed = nn.Embedding(num_items, emb_dim)
+        nn.init.normal_(self.user_embed.weight, std=0.1)
+        nn.init.normal_(self.item_embed.weight, std=0.1)
+
+    def forward(self, edge_index):
+        #embeddings
+        user_emb = self.user_embed.weight
+        item_emb = self.item_embed.weight
+        
+        #concatenate embeddings
+        all_emb = torch.cat([user_emb, item_emb], dim=0)
+        total_nodes = all_emb.size(0)
+        
+        embs = [all_emb]
+        
+        for _ in range(self.n_layers):
+            all_emb = self.propagate(edge_index, x=all_emb, size=(total_nodes, total_nodes))
+            embs.append(all_emb)
+        embs = torch.stack(embs, dim=0)
+        final_emb = torch.mean(embs, dim=0)
+        users_final = final_emb[:self.num_users]
+        items_final = final_emb[self.num_users:self.num_users+self.num_items]
+        
+        return users_final, items_final
+
+class LightGCNRecommender(BaseRecommender):
+    def __init__(self, seed=None, emb_dim=128, n_layers=3):
+        super().__init__(seed)
+        self.emb_dim = emb_dim
+        self.n_layers = n_layers
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.edge_index = None
+
+    def fit(self, log: DataFrame, user_features=None, item_features=None):
+        if item_features is not None:
+            self.price_map = {row.item_idx: row.price for row in item_features.select("item_idx", "price").collect()}
+        else:
+            self.price_map = {row.item_idx: row.relevance for row in log.select("item_idx", "relevance").collect()}
+        
+        #graph construction
+        self.user_ids = [r.user_idx for r in log.select('user_idx').distinct().collect()]
+        self.item_ids = [r.item_idx for r in log.select('item_idx').distinct().collect()]
+        self.user_to_idx = {u: idx for idx, u in enumerate(self.user_ids)}
+        self.item_to_idx = {i: idx for idx, i in enumerate(self.item_ids)}
+        
+        num_users = len(self.user_ids)
+        num_items = len(self.item_ids)
+        print(f"Graph contains {num_users} users and {num_items} items")
+        
+        edges = log.select('user_idx', 'item_idx').collect()
+        
+        src = []
+        dst = []
+        for r in edges:
+            if r.user_idx in self.user_to_idx and r.item_idx in self.item_to_idx:
+                src.append(self.user_to_idx[r.user_idx])
+                dst.append(self.item_to_idx[r.item_idx] + num_users)
+        
+        self.edge_index = torch.tensor([src, dst], dtype=torch.long).to(self.device)
+        print(f"Created edge index with {self.edge_index.shape[1]} edges")
+        
+        prices = torch.tensor([self.price_map[r.item_idx] for r in edges], dtype=torch.float).to(self.device)
+        self.edge_weights = (prices / prices.max()) ** 0.5
+        
+        #lightgcn model
+        self.model = LightGCN(
+            num_users=num_users,
+            num_items=num_items,
+            emb_dim=self.emb_dim,
+            n_layers=self.n_layers
+        ).to(self.device)
+        
+        #training with reduced epochs for testing
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001, weight_decay=1e-5) #l2 regularization
+        print("Starting training...")
+        for epoch in range(20):
+            self.model.train()
+            optimizer.zero_grad()
+            
+            #forward pass
+            user_emb, item_emb = self.model(self.edge_index)
+            
+            #positive scores
+            user_indices = self.edge_index[0]
+            item_indices = self.edge_index[1] - num_users  #convert back to item index
+            pos_scores = (user_emb[user_indices] * item_emb[item_indices]).sum(dim=1).sigmoid()
+            
+            #negative sampling
+            neg_items = torch.randint(0, num_items, (self.edge_index.size(1),), device=self.device)
+            neg_scores = (user_emb[user_indices] * item_emb[neg_items]).sum(dim=1).sigmoid()
+            
+            #BPR Loss
+            loss = -(self.edge_weights * torch.log(torch.sigmoid(pos_scores - neg_scores))).mean()
+            loss.backward()
+            optimizer.step()
+            print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}")
+
+    def predict(self, log, k, users: DataFrame, items: DataFrame, user_features=None, item_features=None, filter_seen_items=True):
+        cross = users.crossJoin(items).toPandas()
+        prices = [self.price_map.get(i, 1.0) for i in cross['item_idx']]
+        
+        user_tensor = []
+        item_tensor = []
+        valid_indices = []
+        
+        for idx, row in cross.iterrows():
+            u = row['user_idx']
+            i = row['item_idx']
+            if u in self.user_to_idx and i in self.item_to_idx:
+                user_tensor.append(self.user_to_idx[u])
+                item_tensor.append(self.item_to_idx[i])
+                valid_indices.append(idx)
+        
+        if not user_tensor:
+            return pandas_to_spark(cross.head(0))
+        
+        user_tensor = torch.tensor(user_tensor, dtype=torch.long, device=self.device)
+        item_tensor = torch.tensor(item_tensor, dtype=torch.long, device=self.device)
+        
+        with torch.no_grad():
+            user_emb, item_emb = self.model(self.edge_index)
+            scores = (user_emb[user_tensor] * item_emb[item_tensor]).sum(dim=1).sigmoid().cpu().numpy()
+        
+        cross.loc[valid_indices, 'relevance'] = scores * (np.array([prices[i] for i in valid_indices]) ** 0.8)
+        cross['relevance'] = cross['relevance'].fillna(0)
+        cross = cross.sort_values(['user_idx', 'relevance'], ascending=[True, False])
+        result = cross.groupby('user_idx').head(k)[['user_idx', 'item_idx', 'relevance']]
+        
+        return pandas_to_spark(result)
