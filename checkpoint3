@@ -68,9 +68,7 @@ class LightGCNRecommender(BaseRecommender):
         self.item_to_idx = {i: idx for idx, i in enumerate(self.item_ids)}
         
         num_users = len(self.user_ids)
-        num_items = len(self.item_ids)
-        print(f"Graph contains {num_users} users and {num_items} items")
-        
+        num_items = len(self.item_ids)        
         edges = log.select('user_idx', 'item_idx').collect()
         
         src = []
@@ -80,9 +78,7 @@ class LightGCNRecommender(BaseRecommender):
                 src.append(self.user_to_idx[r.user_idx])
                 dst.append(self.item_to_idx[r.item_idx] + num_users)
         
-        self.edge_index = torch.tensor([src, dst], dtype=torch.long).to(self.device)
-        print(f"Created edge index with {self.edge_index.shape[1]} edges")
-        
+        self.edge_index = torch.tensor([src, dst], dtype=torch.long).to(self.device)        
         prices = torch.tensor([self.price_map[r.item_idx] for r in edges], dtype=torch.float).to(self.device)
         self.edge_weights = (prices / prices.max()) ** 0.5
         
@@ -96,7 +92,6 @@ class LightGCNRecommender(BaseRecommender):
         
         #training with reduced epochs for testing
         optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001, weight_decay=1e-5) #l2 regularization
-        print("Starting training...")
         for epoch in range(20):
             self.model.train()
             optimizer.zero_grad()
