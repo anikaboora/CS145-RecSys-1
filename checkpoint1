@@ -168,4 +168,151 @@ class LogisticRecommender:
 
         return scored
 
+class GradientBoosting:
+    """
+    Template class for implementing a custom recommender.
+   
+    This class provides the basic structure required to implement a recommender
+    that can be used with the Sim4Rec simulator. Students should extend this class
+    with their own recommendation algorithm.
+    """
+   
+    def __init__(self, seed=None):
+        """
+        Initialize recommender.
+       
+        Args:
+            seed: Random seed for reproducibility
+        """
+        self.seed = seed
+        self.feature_cols = None
+        self.model = None
+        # Add your initialization logic here
+   
+    def fit(self, log, user_features=None, item_features=None):
+        """
+        Train the recommender model based on interaction history.
+       
+        Args:
+            log: Interaction log with user_idx, item_idx, and relevance columns
+            user_features: User features dataframe (optional)
+            item_features: Item features dataframe (optional)
+        """
+        df = log
+
+        if user_features is not None:
+            df = df.join(user_features, on='user_idx', how='left')
+        if item_features is not None:
+            df = df.join(item_features, on='item_idx', how='left')
+
+        pdf = df.toPandas()
+
+        self.categorical_cols = pdf.select_dtypes(include=['category', 'object']).columns.tolist()
+       
+        self.feature_cols = [col for col in pdf.columns if col not in ['user_idx', 'item_idx', 'relevance']]
+
+        pdf_sorted = pdf.sort_values(by='user_idx')
+        X = pdf_sorted[self.feature_cols]
+        y = pdf_sorted['relevance']
+        group_sizes = pdf_sorted.groupby('user_idx').size().tolist()
+
+
+        labelencoder = LabelEncoder()
+
+        for col in self.categorical_cols:
+            X[col] = labelencoder.fit_transform(X[col])
+
+        for col in self.categorical_cols:
+            X[col] = X[col].astype('int')
+
+        self.model = lgb.LGBMRanker(
+            objective='lambdarank',
+            metric='ndcg',
+            boosting_type='gbdt',
+            n_estimators=1000,
+            learning_rate=0.01,
+            random_state=42
+        )
+        self.model.fit(X, y, group=group_sizes, categorical_feature=self.categorical_cols)
+   
+    def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
+        """
+        Generate recommendations for users.
+       
+        Args:
+            log: Interaction log with user_idx, item_idx, and relevance columns
+            k: Number of items to recommend
+            users: User dataframe
+            items: Item dataframe
+            user_features: User features dataframe (optional)
+            item_features: Item features dataframe (optional)
+            filter_seen_items: Whether to filter already seen items
+       
+        Returns:
+            DataFrame: Recommendations with user_idx, item_idx, and relevance columns
+        """
+        # Example of a random recommender implementation:
+        # Cross join users and items
+        # Generate all user-item combinations
+        user_items = users.crossJoin(items)
+
+
+        # Join with features
+        if user_features is not None:
+            user_items = user_items.join(user_features, on='user_idx', how='left')
+        if item_features is not None:
+            user_items = user_items.join(item_features, on='item_idx', how='left')
+
+
+        if filter_seen_items and log is not None:
+            # Remove already interacted user-item pairs
+            seen = log.select('user_idx', 'item_idx').dropDuplicates()
+            user_items = user_items.join(seen, on=['user_idx', 'item_idx'], how='left_anti')
+
+
+        # Convert to pandas for prediction
+        pdf = user_items.toPandas()
+        pdf = pdf.loc[:, ~pdf.columns.duplicated()]
+
+
+        # Keep original indices for result formatting
+        original_user_item = pdf[['user_idx', 'item_idx']].copy()
+
+
+        # Ensure all feature columns are present
+        for col in self.feature_cols:
+            if col not in pdf.columns:
+                pdf[col] = None  # or fill with a default value
+
+
+        # Encode categorical features using LabelEncoder
+        for col in self.categorical_cols:
+            pdf[col] = pdf[col].astype(str)  # ensure consistent dtype
+            pdf[col] = LabelEncoder().fit_transform(pdf[col])  # Fit anew or reuse encoder if saved
+
+
+        X = pdf[self.feature_cols]
+
+
+        # Predict relevance scores
+        preds = self.model.predict(X)
+
+
+        # Attach predictions to user-item pairs
+        result_df = original_user_item.copy()
+        result_df['relevance'] = preds
+
+
+        # Return top-k per user
+        result_df = (
+            result_df.sort_values(['user_idx', 'relevance'], ascending=[True, False])
+            .groupby('user_idx')
+            .head(k)
+            .reset_index(drop=True)
+        )
+
+
+        return spark.createDataFrame(result_df)
+
+
   
