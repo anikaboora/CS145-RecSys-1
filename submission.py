@@ -1,0 +1,187 @@
+import os
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import defaultdict, Counter
+import shutil
+import lightgbm as lgb
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.utils.rnn import pad_sequence
+
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as sf
+from pyspark.sql import DataFrame, Window
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.feature import StringIndexer, OneHotEncoder
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml import Pipeline
+from pyspark.sql.functions import col, lit
+from pyspark.sql.functions import udf
+from pyspark.ml.linalg import Vectors, VectorUDT
+from pyspark.sql.types import DoubleType, ArrayType
+from pyspark.sql.functions import monotonically_increasing_id
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+
+class MyRecommender:
+    def __init__(self, seed=None, num_heads=2, hidden_dim=64, ff_dim=128, dropout=0.1,
+                 num_layers=2, max_seq_len=100, epochs=20, lr=1e-4, batch_size=32):
+        self.seed = seed
+        self.hidden_dim = hidden_dim
+        self.ff_dim = ff_dim
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.num_layers = num_layers
+        self.max_seq_len = max_seq_len
+        self.epochs = epochs
+        self.lr = lr
+        self.batch_size = batch_size
+        self.user_sequences = defaultdict(list)
+        self.device = torch.device('cpu')
+        self.model = None
+        self.optimizer = None
+        self.criterion = nn.CrossEntropyLoss(ignore_index=0)
+
+    def _pad_sequence(self, seq):
+        return [0] * (self.max_seq_len - len(seq)) + seq[-self.max_seq_len:]
+
+    def _build_sequences(self, log, item_features):
+        price_map = dict(item_features.select('item_idx', 'price').toPandas().values)
+        for row in log.select('user_idx', 'item_idx', 'relevance').toPandas().itertuples():
+            self.user_sequences[row.user_idx].append((row.Index, row.item_idx, price_map.get(row.item_idx, 0.0), row.relevance))
+        for seq in self.user_sequences.values():
+            seq.sort()
+
+    def _create_dataset(self):
+        sequences, targets, prices = [], [], []
+        for user, interactions in self.user_sequences.items():
+            items = [i[1] for i in interactions]
+            item_prices = [i[2] for i in interactions]
+            for t in range(1, len(items)):
+                input_seq = self._pad_sequence(items[max(0, t - self.max_seq_len):t])
+                sequences.append((user, input_seq))
+                targets.append(items[t])
+                prices.append(item_prices[t])
+        return sequences, targets, prices
+
+    class InteractionDataset(Dataset):
+        def __init__(self, sequences, targets, prices):
+            self.sequences = sequences
+            self.targets = targets
+            self.prices = prices
+
+        def __len__(self):
+            return len(self.sequences)
+
+        def __getitem__(self, idx):
+            user, seq = self.sequences[idx]
+            return torch.tensor(seq), torch.tensor(self.targets[idx]), torch.tensor(self.prices[idx], dtype=torch.float32)
+
+    class SASRecModel(nn.Module):
+        def __init__(self, num_items, hidden_dim, num_heads, ff_dim, dropout, num_layers, max_seq_len):
+            super().__init__()
+            self.item_embedding = nn.Embedding(num_items + 1, hidden_dim, padding_idx=0)
+            self.pos_embedding = nn.Embedding(max_seq_len, hidden_dim)
+            encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=num_heads,
+                                                       dim_feedforward=ff_dim, dropout=dropout, batch_first=True)
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            self.output_layer = nn.Linear(hidden_dim, num_items + 1)
+            self._init_weights()
+
+        def _init_weights(self):
+            nn.init.xavier_uniform_(self.item_embedding.weight)
+            nn.init.xavier_uniform_(self.output_layer.weight)
+
+        def forward(self, input_seq):
+            positions = torch.arange(input_seq.size(1), device=input_seq.device).unsqueeze(0)
+            x = self.item_embedding(input_seq) + self.pos_embedding(positions)
+            mask = torch.triu(torch.ones(input_seq.size(1), input_seq.size(1), device=input_seq.device), diagonal=1)
+            x = self.transformer(x, mask=mask.masked_fill(mask == 1, float('-inf')))
+            return self.output_layer(x)[:, -1, :]
+
+    def fit(self, log, user_features=None, item_features=None):
+        self._build_sequences(log, item_features)
+        sequences, targets, prices = self._create_dataset()
+        train_seq, val_seq, train_tgt, val_tgt, train_prc, val_prc = train_test_split(
+            sequences, targets, prices, test_size=0.1, random_state=self.seed)
+
+        num_items = log.agg({'item_idx': 'max'}).collect()[0][0] + 1
+        self.model = self.SASRecModel(num_items, self.hidden_dim, self.num_heads, self.ff_dim,
+                                      self.dropout, self.num_layers, self.max_seq_len).to(self.device)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+
+        train_loader = DataLoader(self.InteractionDataset(train_seq, train_tgt, train_prc),
+                                  batch_size=self.batch_size, shuffle=True, num_workers=0)
+        val_loader = DataLoader(self.InteractionDataset(val_seq, val_tgt, val_prc),
+                                batch_size=self.batch_size, num_workers=0)
+
+        best_val_loss, patience, no_improve = float('inf'), 3, 0
+        for epoch in range(self.epochs):
+            self.model.train()
+            train_loss = sum(
+                self._train_batch(seqs, targets)
+                for seqs, targets, _ in train_loader
+            )
+
+            self.model.eval()
+            val_loss = sum(
+                self._eval_batch(seqs, targets)
+                for seqs, targets, _ in val_loader
+            )
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    break
+
+    def _train_batch(self, seqs, targets):
+        seqs, targets = seqs.to(self.device), targets.to(self.device)
+        logits = self.model(seqs)
+        loss = self.criterion(logits, targets)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return loss.item()
+
+    def _eval_batch(self, seqs, targets):
+        with torch.no_grad():
+            seqs, targets = seqs.to(self.device), targets.to(self.device)
+            logits = self.model(seqs)
+            return self.criterion(logits, targets).item()
+
+    def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
+        item_ids = items.select('item_idx').toPandas().item_idx.tolist()
+        price_map = dict(item_features.select('item_idx', 'price').toPandas().values)
+
+        results = []
+        for user_id in users.select('user_idx').toPandas().user_idx:
+            history = self.user_sequences.get(user_id, [])
+            input_seq = torch.tensor([self._pad_sequence([x[1] for x in history])], device=self.device)
+
+            with torch.no_grad():
+                logits = self.model(input_seq)
+                probs = torch.softmax(logits.squeeze(0), dim=0)
+
+            seen = set(x[1] for x in history)
+            scores = [(item, probs[item].item() * price_map.get(item, 0.0)) for item in item_ids]
+            ranked = sorted(scores, key=lambda x: x[1], reverse=True)
+
+            count = 0
+            for item, score in ranked:
+                if filter_seen_items and item in seen:
+                    continue
+                results.append({'user_idx': int(user_id),'item_idx': int(item),'relevance': float(score)})
+                count += 1
+                if count >= k:
+                    break
+
+        return SparkSession.builder.getOrCreate().createDataFrame(results)
