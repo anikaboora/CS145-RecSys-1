@@ -28,6 +28,8 @@ from pyspark.sql.types import DoubleType, ArrayType
 from pyspark.sql.functions import monotonically_increasing_id
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics.pairwise import pairwise_distances
 
 class LogisticRecommender:
     """
@@ -318,4 +320,109 @@ class GradientBoosting:
         return spark.createDataFrame(result_df)
 
 
+class KNNRecommender:
+    def __init__(self, k=10, metric='cosine', user_based=True, seed=None):
+        """
+        Flexible KNN Recommender
+
+        Args:
+            k: number of neighbors
+            metric: distance metric ('cosine', 'euclidean', 'manhattan')
+            user_based: if True, use user-user similarity; else item-item similarity
+            seed: random seed
+        """
+        self.k = k
+        self.metric = metric
+        self.user_based = user_based
+        self.seed = seed
+
+    def fit(self, log, user_features=None, item_features=None):
+        """
+        Prepare scaled feature matrices and index mappings
+        """
+        self.log_df = log.toPandas()
+        self.user_df = user_features.toPandas().set_index("user_idx")
+        self.item_df = item_features.toPandas().set_index("item_idx")
+
+        # Select and normalize numerical features
+        self.user_vecs = StandardScaler().fit_transform(self.user_df.filter(like='user_attr_'))
+        self.item_vecs = StandardScaler().fit_transform(self.item_df.filter(like='item_attr_'))
+
+        self.user_ids = self.user_df.index.tolist()
+        self.item_ids = self.item_df.index.tolist()
+
+        # Create price lookup
+        self.price_lookup = self.item_df["price"].to_dict()
+
+    def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
+        """
+        Recommend items to each user based on similarity and price × similarity scoring
+        """
+        users_pd = users.toPandas()
+        items_pd = items.toPandas()
+
+        # Candidate items per user
+        candidate_map = {int(uid): set(items_pd["item_idx"].tolist()) for uid in users_pd["user_idx"]}
+
+        # Filter out previously seen items
+        if filter_seen_items and log is not None:
+            seen_df = log.select("user_idx", "item_idx").toPandas()
+            for _, row in seen_df.iterrows():
+                uid = int(row["user_idx"])
+                if uid in candidate_map:
+                    candidate_map[uid].discard(row["item_idx"])
+
+        recs = []
+
+        for uid in users_pd["user_idx"]:
+            uid = int(uid)
+            if uid not in self.user_ids:
+                continue
+
+            if self.user_based:
+                # User-based: find similar users
+                query_vec = self.user_vecs[self.user_ids.index(uid)].reshape(1, -1)
+                target_matrix = self.user_vecs
+                targets = self.user_ids
+            else:
+                # Item-based: same query, but compare to items
+                query_vec = self.user_vecs[self.user_ids.index(uid)].reshape(1, -1)
+                target_matrix = self.item_vecs
+                targets = self.item_ids
+
+            # Compute similarities
+            distances = pairwise_distances(query_vec, target_matrix, metric=self.metric).flatten()
+            similarities = 1 / (distances + 1e-8)  # Avoid division by zero
+
+            # Get top-k neighbors
+            top_k_indices = np.argsort(similarities)[-self.k:]
+            top_k = [(targets[i], similarities[i]) for i in top_k_indices]
+
+            # Score items
+            scored = {}
+
+            if self.user_based:
+                for neighbor_uid, sim in top_k:
+                    neighbor_logs = self.log_df[self.log_df["user_idx"] == neighbor_uid]
+                    for _, row in neighbor_logs.iterrows():
+                        item = row["item_idx"]
+                        if item in candidate_map[uid]:
+                            price = self.price_lookup.get(item, 0)
+                            scored[item] = scored.get(item, 0) + sim * price
+            else:
+                for item in candidate_map[uid]:
+                    item_idx = self.item_ids.index(item)
+                    sim = similarities[item_idx]
+                    price = self.price_lookup.get(item, 0)
+                    scored[item] = sim * price
+
+            # Rank and store top-k items
+            top_items = sorted(scored.items(), key=lambda x: x[1], reverse=True)[:k]
+            for item_id, score in top_items:
+                recs.append((int(uid), int(item_id), float(score)))
+
+        # Convert to PySpark DataFrame
+        from pyspark.sql import SparkSession
+        spark = SparkSession.builder.getOrCreate()
+        return spark.createDataFrame(recs, ["user_idx", "item_idx", "relevance"])
   
