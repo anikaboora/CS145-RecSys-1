@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from collections import defaultdict
+from collections import defaultdict, Counter
 import shutil
 import lightgbm as lgb
 import torch
@@ -28,6 +28,7 @@ from pyspark.sql.types import DoubleType, ArrayType
 from pyspark.sql.functions import monotonically_increasing_id
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
+
 
 class RNNModel(nn.Module):
     def __init__(self, n_items, hidden_size=64):
@@ -286,3 +287,79 @@ class TransformerRecommender:
                     break
 
         return SparkSession.builder.getOrCreate().createDataFrame(results)
+
+
+class NGramRecommender:
+    def __init__(self, order=2, smoothing='add_k', k=1.0):
+        self.order = order
+        self.smoothing = smoothing
+        self.k = k
+        self.counts = defaultdict(Counter)
+        self.unigram_counts = Counter()
+        self.total_unigrams = 0
+        self.item_price_dict = {}
+        self.sequences = defaultdict(list)
+
+    def fit(self, log, user_features=None, item_features=None):
+        log = log.toPandas()
+        item_features = item_features.toPandas()
+
+        self.item_price_dict = dict(zip(item_features["item_idx"], item_features["price"]))
+
+        for _, row in log.iterrows():
+            user = row["user_idx"]
+            item = row["item_idx"]
+            relevance = row.get("relevance", 0)
+
+            if relevance > 0:
+                self.sequences[user].append(item)
+
+        for seq in self.sequences.values():
+            for i in range(len(seq)):
+                context = tuple(seq[max(0, i - self.order):i])
+                target = seq[i]
+                self.counts[context][target] += 1
+                self.unigram_counts[target] += 1
+                self.total_unigrams += 1
+
+    def get_smoothed_prob(self, context, item):
+        context = tuple(context)
+        if self.smoothing == "add_k":
+            context_count = sum(self.counts[context].values())
+            return (self.counts[context][item] + self.k) / (context_count + self.k * len(self.unigram_counts))
+        elif self.smoothing == "backoff":
+            for n in range(len(context), -1, -1):
+                subcontext = context[-n:] if n > 0 else ()
+                if subcontext in self.counts and self.counts[subcontext][item] > 0:
+                    context_count = sum(self.counts[subcontext].values())
+                    return self.counts[subcontext][item] / context_count
+            return self.unigram_counts[item] / self.total_unigrams if self.total_unigrams > 0 else 0.0
+        else:
+            raise ValueError("Unsupported smoothing method")
+
+    def predict(self, log, k, users, items, user_features=None, item_features=None, filter_seen_items=True):
+        users = users.toPandas()
+        items = items.toPandas()
+
+        recommendations = []
+        for _, user_row in users.iterrows():
+            uid = user_row["user_idx"]
+            history = self.sequences.get(uid, [])
+
+            context = tuple(history[-self.order:]) if history else ()
+            scores = []
+
+            for _, item_row in items.iterrows():
+                item = item_row["item_idx"]
+                prob = self.get_smoothed_prob(context, item)
+                price = self.item_price_dict.get(item, 1.0)
+                score = prob * price
+                scores.append((item, score))
+
+            top_items = sorted(scores, key=lambda x: x[1], reverse=True)[:k]
+            for item_id, score in top_items:
+                recommendations.append((uid, item_id, float(score)))
+
+        spark = SparkSession.builder.getOrCreate()
+        return spark.createDataFrame(recommendations, ["user_idx", "item_idx", "relevance"])
+
